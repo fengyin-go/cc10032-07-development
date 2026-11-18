@@ -188,6 +188,127 @@ class CheckpointMgrService(BaseModuleService):
             })
         return result
 
+    # ---- 序号7：流关联结果版本的检查点消费 ----
+
+    def consume_join_version(
+        self,
+        version: dict[str, Any],
+        *,
+        config_name: str | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """检查点模块读取同一份关联结果数据并保存窗口、键和聚合结果。
+
+        幂等保证：
+          - 非刷新模式下，版本已有活动检查点则直接返回原检查点（并发只保留一版）；
+          - 检查点快照与关联结果数据在同一调用栈内一起落库，保证同时可见。
+        """
+        version_id = version["version_id"]
+        existing = next(
+            (r for r in store.rows(self.MODULE)
+             if r.get("join_version_id") == version_id and r.get("is_active")),
+            None,
+        )
+        if existing is not None and not refresh:
+            return {
+                "checkpoint_id": existing["checkpoint_id"],
+                "snapshot_ts": existing.get("snapshot_ts"),
+                "idempotent": True,
+            }
+
+        config = self._resolve_join_checkpoint_config(config_name)
+        cp_id = hashlib.md5(
+            f"join_cp|{version_id}|{time.time() if refresh else version['created_at']}".encode()
+        ).hexdigest()[:14]
+
+        # 刷新时把旧检查点置为非活动，保证一个版本对外只有一版活动检查点
+        for row in store.rows(self.MODULE):
+            if row.get("join_version_id") == version_id and row.get("is_active"):
+                row["is_active"] = False
+                row["status"] = "已停用"
+
+        cp_row = {
+            "id": max(
+                (int(r.get("id", 0)) for r in store.rows(self.MODULE)
+                 if isinstance(r.get("id"), int)),
+                default=0,
+            ) + 1,
+            "配置名称": config.get("配置名称", f"join_checkpoint_{version['join_name']}"),
+            "间隔时间": config.get("间隔时间", "30"),
+            "超时时长": config.get("超时时长", "60"),
+            "最大并发": config.get("最大并发", "1"),
+            "对齐策略": "exactly_once",
+            "保留数量": config.get("保留数量", 5),
+            "外部化路径": (
+                f"{config.get('外部化路径', '/data/checkpoints')}/join/{version_id}"
+            ),
+            "status": "已启用",
+            "pending": False,
+            "abnormal": False,
+            "checkpoint_id": cp_id,
+            "join_version_id": version_id,
+            "join_name": version["join_name"],
+            "window_start": version["window_start"],
+            "window_end": version["window_end"],
+            "join_keys": sorted(version["key_results"].keys()),
+            "operator_states": {
+                # 回放时凭此即可定位完整版本并核对聚合结果
+                "join_version_id": version_id,
+                "window": [version["window_start"], version["window_end"]],
+                "stats": copy.deepcopy(version["stats"]),
+                "key_results": copy.deepcopy(version["key_results"]),
+                "snapshot": copy.deepcopy(version.get("snapshot")),
+            },
+            "snapshot_ts": time.time(),
+            "is_active": True,
+            "source": "join_stream",
+        }
+        store.rows(self.MODULE).append(cp_row)
+        return {"checkpoint_id": cp_id, "snapshot_ts": cp_row["snapshot_ts"], "idempotent": False}
+
+    def _resolve_join_checkpoint_config(self, config_name: str | None) -> dict[str, Any]:
+        if config_name:
+            for r in store.rows(self.MODULE):
+                if r.get("配置名称") == config_name and not r.get("checkpoint_id"):
+                    return r
+        # 默认取一个已启用的检查点配置；没有则用内置默认值
+        for r in store.rows(self.MODULE):
+            if not r.get("checkpoint_id") and r.get("status") == "已启用":
+                return r
+        return {}
+
+    def mark_active_checkpoint(self, version_id: str, checkpoint_id: str) -> None:
+        """在版本详情窗口切换检查点引用：同版本只保留一个活动检查点。"""
+        for row in store.rows(self.MODULE):
+            if row.get("join_version_id") == version_id:
+                is_target = row.get("checkpoint_id") == checkpoint_id
+                row["is_active"] = is_target
+                if is_target:
+                    row["status"] = "已启用"
+
+    def list_join_checkpoints(self, version_id: str | None = None) -> list[dict[str, Any]]:
+        """另一个入口（检查点模块）：列出流关联版本产生的检查点并联动工作台。"""
+        rows = [
+            r for r in store.rows(self.MODULE)
+            if r.get("source") == "join_stream"
+            and (version_id is None or r.get("join_version_id") == version_id)
+        ]
+        return [
+            {
+                "checkpoint_id": r.get("checkpoint_id"),
+                "join_version_id": r.get("join_version_id"),
+                "join_name": r.get("join_name"),
+                "window_start": r.get("window_start"),
+                "window_end": r.get("window_end"),
+                "key_count": len(r.get("join_keys", [])),
+                "is_active": r.get("is_active", False),
+                "status": r.get("status"),
+                "snapshot_ts": r.get("snapshot_ts"),
+                "external_path": r.get("外部化路径"),
+            }
+            for r in rows
+        ]
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)

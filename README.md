@@ -79,5 +79,41 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 序号7：流关联结果版本（可恢复、可检查点消费）
+
+流关联模块在通用 CRUD 之外提供关联结果版本能力，代码位于
+`backend/app/services/join_stream.py` 与 `backend/app/routers/join_pipeline.py`，
+前端入口为「流关联工作台」（`frontend/src/views/JoinWorkbench.vue`，路由 `/join_stream`）。
+
+- **确定性版本**：版本 ID 只由 `关联配置 + 窗口起止 + 合并模式` 决定，
+  同窗口并发重试命中同一版本，只保留一版且完全幂等；窗口与版本是唯一映射，
+  每个关联键只能在一个窗口版本中生成确定结果。
+- **重复键与迟到事件**：`window_cutoff`（窗口结束时间统一截断、保留最早）和
+  `last_arrival`（按最后到达事件合并、保留最新）两种模式；晚于窗口结束的事件被截断计数。
+- **原子可见**：关联结果数据、聚合落库快照（`aggregate_sink`）与检查点引用
+  （`checkpoint_mgr`，保存窗口、键和聚合结果）在同一事务内生效，任一步失败整体回滚并保留原状态。
+- **单向生命周期**：`计算中 → 待检查点 → 已确认 → 已归档`，
+  已确认/已归档窗口不能回退；中断恢复只补未完成键；归档版本只能凭检查点引用只读恢复。
+- **检查点联动**：`GET /api/join-stream/checkpoints/locate/{checkpoint_id}`
+  可由检查点反查完整版本用于回放；版本详情窗口可在同版本检查点历史内切换/刷新引用，
+  并发刷新只保留一个活动检查点。
+- **工作台**：支持按关联配置、窗口结束时间、生命周期筛选，
+  每个版本展示检查点引用与聚合落库状态，状态详情可按窗口版本核对数据与快照。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/join-stream/versions` | 读取双流事件生成关联结果版本（幂等） |
+| GET | `/api/join-stream/versions` | 工作台窗口筛选 |
+| GET | `/api/join-stream/versions/{id}` | 版本状态详情（快照+检查点+状态链路） |
+| POST | `/api/join-stream/versions/{id}/resume` | 中断恢复，只补未完成键 |
+| POST | `/api/join-stream/versions/{id}/confirm` | 确认窗口（封存不可回退） |
+| POST | `/api/join-stream/versions/{id}/archive` | 归档（归档条件写入版本数据） |
+| POST | `/api/join-stream/versions/{id}/restore-read` | 归档版本只读恢复 |
+| POST | `/api/join-stream/versions/{id}/checkpoint/switch` | 切换活动检查点引用 |
+| POST | `/api/join-stream/versions/{id}/checkpoint/refresh` | 刷新检查点 |
+| GET | `/api/join-stream/checkpoints/locate/{cp_id}` | 检查点回放定位完整版本 |
+| GET | `/api/join-stream/checkpoints` | 检查点模块联动入口 |
+| GET | `/api/join-stream/statistics` | 版本生命周期分布统计 |
+
 领域：数据工程
 子方向：数据分析与数据应用

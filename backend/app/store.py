@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -89,6 +90,78 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # 流关联（序号7）关联结果版本：version_id → 版本记录
+        # 版本是检查点可消费的最小单位，独立于模块表存放，保证跨模块按版本读取
+        self._join_versions: dict[str, dict[str, Any]] = {}
+        # 窗口唯一映射：(关联配置, 窗口开始, 窗口结束) → version_id
+        self._join_windows: dict[tuple[str, float, float], str] = {}
+        # 关联结果版本的并发保护：同一版本同时只允许一个写事务
+        self._join_locks: dict[str, threading.RLock] = {}
+        self._join_locks_guard = threading.Lock()
+
+    # ---- 流关联结果版本（序号7）----
+
+    def join_version_lock(self, version_id: str) -> threading.RLock:
+        """返回指定关联结果版本的可重入锁；并发重试在同一把锁上排队。"""
+        with self._join_locks_guard:
+            lock = self._join_locks.get(version_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._join_locks[version_id] = lock
+            return lock
+
+    def save_join_version(self, version: dict[str, Any]) -> dict[str, Any]:
+        """落盘一个关联结果版本（整体覆盖，调用方需先取版本锁）。"""
+        self._join_versions[version["version_id"]] = version
+        return version
+
+    def get_join_version(self, version_id: str) -> dict[str, Any] | None:
+        return self._join_versions.get(version_id)
+
+    def list_join_versions(
+        self, join_name: str | None = None, window_end: float | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        versions = list(self._join_versions.values())
+        if join_name:
+            versions = [v for v in versions if v.get("join_name") == join_name]
+        if window_end is not None:
+            versions = [v for v in versions if float(v.get("window_end", -1)) == float(window_end)]
+        if status:
+            versions = [v for v in versions if v.get("lifecycle_status") == status]
+        versions.sort(key=lambda v: (v.get("window_end", 0), v.get("version_seq", 0)))
+        return versions
+
+    def find_join_version(self, checkpoint_id: str) -> dict[str, Any] | None:
+        """检查点回放入口：通过检查点引用反查完整关联结果版本。"""
+        for version in self._join_versions.values():
+            if version.get("checkpoint_id") == checkpoint_id:
+                return version
+            for cp in version.get("checkpoint_history", []):
+                if cp.get("checkpoint_id") == checkpoint_id:
+                    return version
+        return None
+
+    def register_join_window(
+        self,
+        window_key: tuple[str, float, float],
+        version_id: str,
+    ) -> None:
+        """登记窗口 → 版本的唯一映射：每个关联键只能在一个窗口版本中出结果。
+
+        窗口键固定为 (关联配置名称, 窗口开始, 窗口结束)，重复登记必须指向同一版本。
+        """
+        existing = self._join_windows.get(window_key)
+        if existing is not None and existing != version_id:
+            raise RuntimeError(
+                f"窗口 {window_key} 已绑定版本 {existing}，不能再绑定 {version_id}"
+            )
+        self._join_windows[window_key] = version_id
+
+    def find_join_window(
+        self, window_key: tuple[str, float, float],
+    ) -> str | None:
+        return self._join_windows.get(window_key)
 
     # ---- 跨模块数据通道 ----
 

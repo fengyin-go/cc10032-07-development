@@ -181,6 +181,25 @@ class AggregateSinkService(BaseModuleService):
             })
         return result
 
+    def get_snapshot_by_version(self, version_id: str) -> dict[str, Any] | None:
+        """序号7联动：按关联结果版本定位聚合落库快照与写入状态。"""
+        for row in store.rows(self.MODULE):
+            if row.get("join_version_id") == version_id:
+                return {
+                    "sink_record_id": row.get("id"),
+                    "task_name": row.get("任务名称"),
+                    "snapshot_status": row.get("snapshot_status", "未落地"),
+                    "status": row.get("status"),
+                    "window_start": row.get("window_start"),
+                    "window_end": row.get("window_end"),
+                    "stats": {
+                        k.replace("stat_", ""): row.get(k)
+                        for k in ("stat_total_keys", "stat_matched",
+                                  "stat_unmatched", "stat_match_rate")
+                    },
+                }
+        return None
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         rows = store.rows(self.MODULE)
